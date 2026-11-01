@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart' show StateProvider;
 
 import 'lwe_controller.dart';
+import 'lwe_driver.dart';
 import 'lwe_updater.dart';
 import 'workshop_discovery.dart';
 
@@ -13,6 +14,14 @@ export 'lwe_panel_bus.dart' show LwePanelBus, LwePanelEvent;
 
 /// Bumped every time the panel opens so [lweUpdateCheckProvider] re-runs.
 final lweUpdateNonceProvider = StateProvider<int>((ref) => 0);
+
+/// The engine crash the panel currently shows, if any. Fed by the panel from
+/// [LweDriver.failures] and [LweDriver.lastFailure]; watched by the failure
+/// banner and the wallpaper grid (which flags the broken tile). Cleared on a
+/// healthy start or when the user dismisses it.
+final lweEngineFailureProvider = StateProvider<LweEngineFailure?>(
+  (ref) => null,
+);
 
 /// Runs an update check against the host; recomputes whenever the nonce
 /// changes (i.e. each time the panel is opened).
@@ -102,6 +111,15 @@ class _T {
       isZh ? '无法打开浏览器，也无法复制链接' : 'Could not open a browser or copy the link';
   static String versionLabel(String current, String latest) =>
       isZh ? '当前 $current → 最新 $latest' : 'current $current → latest $latest';
+
+  // --- Engine failure banner ---
+  static String get engineCrashed =>
+      isZh ? '壁纸启动失败，引擎已退出' : 'Wallpaper failed to start; the engine exited';
+  static String get engineCrashedTile =>
+      isZh ? '此壁纸导致引擎崩溃' : 'This wallpaper crashed the engine';
+  static String get tryAnotherWallpaper =>
+      isZh ? '换一个壁纸试试' : 'Try another wallpaper';
+  static String get dismiss => isZh ? '知道了' : 'Dismiss';
 }
 
 /// Full-screen wallpaper manager overlay mounted on the aboveWindows layer.
@@ -128,9 +146,30 @@ class _LweWallpaperPanelState extends ConsumerState<LweWallpaperPanel> {
   LweState get draft => _draft!;
 
   LweState? _loadedState;
+  StreamSubscription<LweEngineFailure?>? _failureSub;
+
+  @override
+  void initState() {
+    super.initState();
+    // The panel is mounted fresh on each open, so seed from the driver's
+    // retained failure: a wallpaper that crashed during the startup restore
+    // (panel closed) must still be visible when the user opens it.
+    final retained = ref.read(lweDriverProvider).lastFailure;
+    if (retained != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted)
+          ref.read(lweEngineFailureProvider.notifier).state = retained;
+      });
+    }
+    _failureSub = ref.read(lweDriverProvider).failures.listen((failure) {
+      if (!mounted) return;
+      ref.read(lweEngineFailureProvider.notifier).state = failure;
+    });
+  }
 
   @override
   void dispose() {
+    _failureSub?.cancel();
     _toastTimer?.cancel();
     super.dispose();
   }
@@ -168,8 +207,16 @@ class _LweWallpaperPanelState extends ConsumerState<LweWallpaperPanel> {
   /// panel closes shortly after a toast, so the user immediately SEES the
   /// wallpaper change the panel was blocking. Failures stay with an error
   /// toast so the draft can be fixed.
+  ///
+  /// A wallpaper that crashes the engine does NOT close the panel: the driver
+  /// only reports the crash a few seconds after spawning, and closing then
+  /// would hide the failure banner and read as "the plugin is broken".
+  /// Instead we wait for that start's verdict and stay open with the banner
+  /// and the flagged tile so the user can pick another wallpaper.
   Future<void> _applyDraft() async {
     final d = draft;
+    final driver = ref.read(lweDriverProvider);
+    final verdictBefore = driver.lastStartVerdict;
     try {
       await _run(
         () => ref
@@ -182,6 +229,24 @@ class _LweWallpaperPanelState extends ConsumerState<LweWallpaperPanel> {
             ),
       );
       if (!mounted) return;
+      // A new verdict future means commitPanel actually restarted the engine.
+      final verdict = driver.lastStartVerdict;
+      if (verdict != null && !identical(verdict, verdictBefore)) {
+        // Engine crashes land within a few hundred ms of spawn; the healthy
+        // verdict only arrives after the full crash window. Cap the wait so
+        // a normal apply still closes promptly — a verdict that arrives after
+        // the timeout still raises the banner via the failure stream.
+        final failure = await verdict.timeout(
+          const Duration(milliseconds: 2500),
+          onTimeout: () => null,
+        );
+        if (!mounted) return;
+        if (failure != null) {
+          // Keep the draft: the user picks a different wallpaper and retries.
+          _showToast(_T.engineCrashed);
+          return;
+        }
+      }
       setState(() => _draft = null);
       _showToast(_T.appliedClosing);
       Future.delayed(const Duration(milliseconds: 900), () {
@@ -275,6 +340,12 @@ class _LweWallpaperPanelState extends ConsumerState<LweWallpaperPanel> {
                 height: 1,
                 color: scheme.outlineVariant.withValues(alpha: .4),
               ),
+              _EngineFailureBanner(
+                onDismiss: () {
+                  ref.read(lweDriverProvider).clearFailure();
+                  ref.read(lweEngineFailureProvider.notifier).state = null;
+                },
+              ),
               _UpdateBanner(
                 onCheckAgain: () => ref
                     .read(lweUpdateNonceProvider.notifier)
@@ -291,6 +362,9 @@ class _LweWallpaperPanelState extends ConsumerState<LweWallpaperPanel> {
                         activeId: state.currentWallpaperId,
                         selectedId: draft.currentWallpaperId,
                         enabled: state.enabled && !_busy,
+                        failedId: ref
+                            .watch(lweEngineFailureProvider)
+                            ?.wallpaperId,
                         onSelect: (id) => _updateDraft(
                           (d) => d.copyWith(currentWallpaperId: id),
                         ),
@@ -614,6 +688,64 @@ class _Toast extends StatelessWidget {
   }
 }
 
+/// Red banner shown while the engine crashed on the current wallpaper. The
+/// point is honesty: a wallpaper the engine cannot render must announce
+/// itself instead of silently flipping the enable toggle back off, which
+/// reads as "the plugin is broken".
+class _EngineFailureBanner extends ConsumerWidget {
+  const _EngineFailureBanner({required this.onDismiss});
+
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final failure = ref.watch(lweEngineFailureProvider);
+    if (failure == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final wallpapers = ref.watch(lweWallpapersProvider).value ?? const [];
+    String? title;
+    for (final w in wallpapers) {
+      if (w.id == failure.wallpaperId) {
+        title = w.title;
+        break;
+      }
+    }
+    final label = StringBuffer(
+      '${_T.engineCrashed}${title == null ? '' : '：$title'}',
+    );
+    if (failure.detail != null && failure.detail!.isNotEmpty) {
+      label.write('\n${failure.detail}');
+    }
+    return Container(
+      padding: const EdgeInsets.fromLTRB(24, 8, 12, 8),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: .35),
+        border: Border(bottom: BorderSide(color: scheme.errorContainer)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.error_rounded, color: scheme.error, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              label.toString(),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12, color: scheme.onErrorContainer),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _T.tryAnotherWallpaper,
+            style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+          ),
+          TextButton(onPressed: onDismiss, child: Text(_T.dismiss)),
+        ],
+      ),
+    );
+  }
+}
+
 /// Update banner shown at the top of the panel. Runs an update check whenever
 /// the panel opens and renders one of several states: checking, an available
 /// update (with a one-click "Update" when a package manager is known), up to
@@ -813,6 +945,7 @@ class _WallpaperGrid extends ConsumerWidget {
     required this.enabled,
     required this.onSelect,
     required this.onTogglePlaylist,
+    this.failedId,
   });
 
   final List<String> playlist;
@@ -821,6 +954,11 @@ class _WallpaperGrid extends ConsumerWidget {
   final bool enabled;
   final ValueChanged<String> onSelect;
   final ValueChanged<String> onTogglePlaylist;
+
+  /// The wallpaper the engine crashed on, when a failure is on screen. Its
+  /// tile gets a red badge so the blame lands on the wallpaper, not the
+  /// panel.
+  final String? failedId;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -890,6 +1028,7 @@ class _WallpaperGrid extends ConsumerWidget {
                     running: item.id == activeId,
                     inPlaylist: playlist.contains(item.id),
                     enabled: enabled,
+                    failed: item.id == failedId,
                     onSelect: () => onSelect(item.id),
                     onTogglePlaylist: () => onTogglePlaylist(item.id),
                   );
@@ -912,6 +1051,7 @@ class _Tile extends StatelessWidget {
     required this.enabled,
     required this.onSelect,
     required this.onTogglePlaylist,
+    this.failed = false,
   });
 
   final WorkshopWallpaper item;
@@ -921,6 +1061,9 @@ class _Tile extends StatelessWidget {
   final bool enabled;
   final VoidCallback onSelect;
   final VoidCallback onTogglePlaylist;
+
+  /// True when the engine crashed on this exact wallpaper.
+  final bool failed;
 
   @override
   Widget build(BuildContext context) {
@@ -935,12 +1078,14 @@ class _Tile extends StatelessWidget {
           decoration: BoxDecoration(
             borderRadius: radius,
             border: Border.all(
-              color: selected
+              color: failed
+                  ? scheme.error
+                  : selected
                   ? scheme.primary
                   : running
                   ? scheme.primary.withValues(alpha: .55)
                   : scheme.outlineVariant,
-              width: selected ? 2 : 1,
+              width: (failed || selected) ? 2 : 1,
             ),
           ),
           child: ClipRRect(
@@ -968,6 +1113,26 @@ class _Tile extends StatelessWidget {
                     onTap: onTogglePlaylist,
                   ),
                 ),
+                if (failed)
+                  Positioned(
+                    top: 4,
+                    left: 4,
+                    child: Tooltip(
+                      message: _T.engineCrashedTile,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: scheme.error,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: const Icon(
+                          Icons.bug_report_rounded,
+                          size: 14,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
                 Positioned(
                   left: 0,
                   right: 0,

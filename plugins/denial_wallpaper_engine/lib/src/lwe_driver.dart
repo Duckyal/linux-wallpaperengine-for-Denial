@@ -20,6 +20,49 @@ class LweDriver {
   Future<void> _applyQueue = Future<void>.value();
   String? _cachedWaylandDisplay;
 
+  /// How long a freshly started engine must survive before we consider it
+  /// healthy. Exits before this window with a non-zero code are crashes
+  /// (e.g. scene wallpapers the engine cannot parse abort with SIGABRT).
+  static const crashWindow = Duration(seconds: 5);
+
+  final StreamController<LweEngineFailure?> _failures =
+      StreamController<LweEngineFailure?>.broadcast();
+
+  /// Crash/recovery events for the engine started by [apply]. Emits a
+  /// [LweEngineFailure] when a fresh process dies inside [crashWindow], and
+  /// `null` when a process survives it (the panel clears its error banner on
+  /// that). A broadcast stream: late subscribers (panel open) see only events
+  /// after they subscribe, which is fine — the banner is transient UX.
+  Stream<LweEngineFailure?> get failures => _failures.stream;
+
+  /// The most recent crash, kept so a failure that happened while the panel
+  /// was closed (e.g. a startup restore) still greets the user when they open
+  /// it. Cleared by a healthy start or [clearFailure].
+  LweEngineFailure? get lastFailure => _lastFailure;
+  LweEngineFailure? _lastFailure;
+
+  /// Drops [lastFailure] after the user acknowledged it.
+  void clearFailure() => _lastFailure = null;
+
+  /// Verdict of the most recent [apply]: completes with a [LweEngineFailure]
+  /// when the engine crashed on that wallpaper, or `null` when it survived
+  /// [crashWindow] or was stopped/replaced intentionally. Created at spawn
+  /// time and handed to the exit watcher, so a caller that awaits it right
+  /// after `apply` returns cannot miss the event (unlike the [failures]
+  /// stream). The panel uses it to decide whether to close after Apply: a
+  /// wallpaper that crashes the engine must keep the panel open so the
+  /// failure stays visible.
+  Future<LweEngineFailure?>? get lastStartVerdict => _verdict?.future;
+
+  Completer<LweEngineFailure?>? _verdict;
+
+  static void _settle(
+    Completer<LweEngineFailure?>? verdict,
+    LweEngineFailure? failure,
+  ) {
+    if (verdict != null && !verdict.isCompleted) verdict.complete(failure);
+  }
+
   /// True while a scheduled startup apply has not fired yet. The panel-open
   /// sync defers to it: the engine being absent during the first-frame
   /// window is intentional and must not read as "stopped".
@@ -81,16 +124,81 @@ class LweDriver {
       rethrow;
     }
     final process = _process!;
+    // Fresh verdict for this start; the watcher settles it.
+    final verdict = Completer<LweEngineFailure?>();
+    _verdict = verdict;
     process.stdout.drain<void>();
+    // Keep the last few stderr lines: when the engine aborts, its own error
+    // text (e.g. a json type_error from a broken scene) is the most useful
+    // thing to show the user.
+    final stderrTail = <String>[];
     process.stderr
         .transform(utf8.decoder)
         .transform(const LineSplitter())
-        .listen((line) => lweLog('engine stderr: $line'));
-    unawaited(
-      process.exitCode.then(
-        (code) => lweLog('engine pid=${process.pid} exited code=$code'),
-      ),
+        .listen((line) {
+          lweLog('engine stderr: $line');
+          stderrTail.add(line);
+          if (stderrTail.length > 5) stderrTail.removeAt(0);
+        });
+    unawaited(_watchExit(process, id, stderrTail, verdict));
+  }
+
+  /// Watches [process] for a crash and reports it on [failures]. Exits inside
+  /// [crashWindow] surface as "this wallpaper failed to start"; a process that
+  /// survives the window announces itself healthy first, and a LATER non-zero
+  /// exit still surfaces (the engine died on its own, e.g. an abort minutes
+  /// into rendering). Intentional stops replace or null out [_process] first,
+  /// so their SIGKILL exits never read as a crash.
+  Future<void> _watchExit(
+    Process process,
+    String wallpaperId,
+    List<String> stderrTail,
+    Completer<LweEngineFailure?> verdict,
+  ) async {
+    const pending = -0x7FFFF;
+    final early = await process.exitCode.timeout(
+      crashWindow,
+      onTimeout: () => pending,
     );
+    if (early == pending) {
+      // Survived the window: healthy start. Tell subscribers so a stale
+      // failure banner from a previous attempt can clear itself.
+      lweLog('engine pid=${process.pid} healthy past crash window');
+      _lastFailure = null;
+      _failures.add(null);
+      _settle(verdict, null);
+      final late = await process.exitCode;
+      lweLog('engine pid=${process.pid} exited code=$late');
+      if (late == 0 || !identical(process, _process)) return;
+      _reportCrash(process, wallpaperId, late, stderrTail);
+      return;
+    }
+    lweLog('engine pid=${process.pid} exited code=$early');
+    if (early == 0 || !identical(process, _process)) {
+      // Clean exit or an intentional stop/replacement: this start is over.
+      _settle(verdict, null);
+      return;
+    }
+    _reportCrash(process, wallpaperId, early, stderrTail);
+    _settle(verdict, _lastFailure);
+  }
+
+  void _reportCrash(
+    Process process,
+    String wallpaperId,
+    int exitCode,
+    List<String> stderrTail,
+  ) {
+    _process = null;
+    final failure = LweEngineFailure(
+      wallpaperId: wallpaperId,
+      exitCode: exitCode,
+      detail: stderrTail.isEmpty
+          ? null
+          : stderrTail[stderrTail.length - 1].trim(),
+    );
+    _lastFailure = failure;
+    _failures.add(failure);
   }
 
   /// Whether a wallpaper engine process is actually rendering right now.
@@ -173,6 +281,11 @@ class LweDriver {
     } else if (lastPid != null) {
       Process.run('kill', ['-9', '$lastPid'], runInShell: false);
     }
+  }
+
+  /// Releases the failure stream. Called from the provider's dispose.
+  void dispose() {
+    _failures.close();
   }
 
   /// Kills any stale linux-wallpaperengine instances from previous sessions.
@@ -329,10 +442,29 @@ class LweSettings {
   );
 }
 
+/// Why an engine process died during its crash window. Surfaced to the panel
+/// so a wallpaper the engine cannot render shows up as a visible failure
+/// instead of silently flipping the toggle back off.
+class LweEngineFailure {
+  const LweEngineFailure({
+    required this.wallpaperId,
+    required this.exitCode,
+    this.detail,
+  });
+
+  final String wallpaperId;
+  final int exitCode;
+
+  /// Last stderr line the engine printed before dying, when available.
+  final String? detail;
+}
+
 /// Provider for the LweDriver.
 final lweDriverProvider = Provider<LweDriver>((ref) {
   final home = Platform.environment['HOME'] ?? '/';
-  return LweDriver(
+  final driver = LweDriver(
     configPath: '$home/.config/denial-wallpaper-engine/config.json',
   );
+  ref.onDispose(driver.dispose);
+  return driver;
 });
